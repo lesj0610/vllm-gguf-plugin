@@ -6,6 +6,7 @@ from functools import partial
 import gguf
 import torch
 from gguf import GGMLQuantizationType as WeightType
+from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -21,6 +22,9 @@ from .params import (
     _materialize_gguf_weight_type_parameter,
 )
 from .utils import DEQUANT_TYPES, UNQUANTIZED_TYPES
+
+logger = init_logger(__name__)
+_WARMED_EMBEDDING_DEQUANT_KERNELS: set[tuple[str, int | None, int, torch.dtype]] = set()
 
 
 def _apply_gguf_embedding(
@@ -129,6 +133,40 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
             "qweight_type",
             fallback_weight_loader=_gguf_embedding_weight_type_loader,
         )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        super().process_weights_after_loading(layer)
+        self._warmup_embedding_dequant(layer)
+
+    def _warmup_embedding_dequant(self, layer: torch.nn.Module) -> None:
+        qweight = layer.qweight
+        qweight_type = layer.qweight_type.weight_type
+        if (
+            qweight_type not in DEQUANT_TYPES
+            or not qweight.is_cuda
+            or qweight.numel() == 0
+        ):
+            return
+
+        device = qweight.device
+        device_key = (device.type, device.index, int(qweight_type), self.params_dtype)
+        if device_key in _WARMED_EMBEDDING_DEQUANT_KERNELS:
+            return
+
+        block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+        hidden_size = qweight.shape[1] // type_size * block_size
+        try:
+            ops.ggml_dequantize(
+                qweight.narrow(0, 0, 1).contiguous(),
+                qweight_type,
+                hidden_size,
+                1,
+                self.params_dtype,
+            )
+            torch.cuda.synchronize(device)
+            _WARMED_EMBEDDING_DEQUANT_KERNELS.add(device_key)
+        except Exception:
+            logger.debug("GGUF embedding dequant warmup failed.", exc_info=True)
 
     def embedding(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
         from . import apply_gguf_embedding as apply_gguf_embedding_op
